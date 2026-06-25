@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: nexora_db
+    restart: always
+    environment:
+      POSTGRES_DB: nexora_db
+      POSTGRES_USER: nexora_user
+      POSTGRES_PASSWORD: nexora_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  cache:
+    image: redis:7-alpine
+    container_name: nexora_cache
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+
+volumes:
+  pgdata:
+  redisdata:
