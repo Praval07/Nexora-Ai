@@ -21,4 +21,4 @@ if __name__ == "__main__":
     debug = app.config.get("DEBUG", True)
     
     print(f"Starting Nexora AI API Server on {host}:{port} ({env_name} mode)...")
-    socketio.run(app, host=host, port=port, debug=debug)
+    socketio.run(app, host=host, port=port, debug=debug, allow_unsafe_werkzeug=True)
