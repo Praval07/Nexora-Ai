@@ -15,7 +15,7 @@ attendance_bp = Blueprint("attendance", __name__)
 def enroll_student_face():
     """
     Endpoint for enrolling a student's face.
-    Expects multipart/form-data with 'student_id' and 'file' fields.
+    Expects multipart/form-data with 'student_id', 'file' and other profile metadata fields.
     """
     student_id = request.form.get("student_id")
     file = request.files.get("file")
@@ -30,7 +30,13 @@ def enroll_student_face():
     face = AttendanceService.enroll_student_face(
         tenant_id=tenant_id,
         student_id=student_id,
-        image_bytes=image_bytes
+        image_bytes=image_bytes,
+        roll_number=request.form.get("roll_number"),
+        mobile_number=request.form.get("mobile_number"),
+        department=request.form.get("department"),
+        course=request.form.get("course"),
+        semester_grade=request.form.get("semester_grade"),
+        section=request.form.get("section")
     )
     
     return jsonify({
@@ -203,5 +209,99 @@ def review_correction(correction_id):
         "data": {
             "correction_id": str(correction.id),
             "status": correction.status
+        }
+    }), 200
+
+@attendance_bp.route("/timetable", methods=["GET"])
+@jwt_required()
+def get_timetable():
+    """
+    Endpoint to retrieve timetable slots for the teacher.
+    """
+    claims = get_jwt()
+    tenant_id = claims.get("tenant_id")
+    teacher_id = get_jwt_identity()
+    
+    slots = AttendanceService.get_timetable(tenant_id, teacher_id)
+    return jsonify({
+        "status": "success",
+        "data": {
+            "slots": slots
+        }
+    }), 200
+
+@attendance_bp.route("/students", methods=["GET"])
+@jwt_required()
+def get_students():
+    """
+    Endpoint to list all students in a section (or all students in the tenant).
+    """
+    claims = get_jwt()
+    tenant_id = claims.get("tenant_id")
+    section_id = request.args.get("section_id")
+    
+    students = AttendanceService.get_students_for_section(tenant_id, section_id)
+    return jsonify({
+        "status": "success",
+        "data": {
+            "students": students
+        }
+    }), 200
+
+@attendance_bp.route("/sessions", methods=["GET"])
+@jwt_required()
+def get_sessions():
+    """
+    Endpoint to retrieve past/recent attendance sessions.
+    """
+    claims = get_jwt()
+    tenant_id = claims.get("tenant_id")
+    user_id = get_jwt_identity()
+    
+    # Determine if user is a teacher based on their permissions/roles
+    permissions = claims.get("permissions", [])
+    is_teacher = "attendance:mark" in permissions
+    
+    sessions = AttendanceService.get_sessions(tenant_id, user_id, is_teacher)
+    return jsonify({
+        "status": "success",
+        "data": {
+            "sessions": sessions
+        }
+    }), 200
+
+@attendance_bp.route("/sessions/<uuid:session_id>", methods=["GET"])
+@jwt_required()
+def get_session_details(session_id):
+    """
+    Endpoint to retrieve details of a specific session and its student records.
+    """
+    claims = get_jwt()
+    tenant_id = claims.get("tenant_id")
+    
+    details = AttendanceService.get_session_details(tenant_id, str(session_id))
+    return jsonify({
+        "status": "success",
+        "data": details
+    }), 200
+
+@attendance_bp.route("/corrections", methods=["GET"])
+@jwt_required()
+def get_corrections():
+    """
+    Endpoint to retrieve correction requests.
+    """
+    claims = get_jwt()
+    tenant_id = claims.get("tenant_id")
+    user_id = get_jwt_identity()
+    
+    permissions = claims.get("permissions", [])
+    is_teacher = "attendance:edit" in permissions
+    
+    corrections = AttendanceService.get_corrections(tenant_id, user_id, is_teacher)
+    return jsonify({
+        "status": "success",
+        "data": {
+            "corrections": corrections
         }
     }), 200

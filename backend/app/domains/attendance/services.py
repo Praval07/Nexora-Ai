@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from backend.app.core.database import db
-from backend.app.domains.attendance.models import StudentFace, AttendanceSession, AttendanceRecord, AttendanceCorrection
+from backend.app.domains.attendance.models import StudentFace, StudentProfile, AttendanceSession, AttendanceRecord, AttendanceCorrection
 from backend.app.domains.attendance.ai_engine import AIAttendanceEngine
 from backend.app.domains.auth.models import User, AuditLog
 from backend.app.core.exceptions import NotFoundException, BadRequestException, ConflictException
@@ -11,7 +11,10 @@ ai_engine = AIAttendanceEngine()
 
 class AttendanceService:
     @staticmethod
-    def enroll_student_face(tenant_id: str, student_id: str, image_bytes: bytes):
+    def enroll_student_face(tenant_id: str, student_id: str, image_bytes: bytes,
+                            roll_number: str = None, mobile_number: str = None,
+                            department: str = None, course: str = None,
+                            semester_grade: str = None, section: str = None):
         """
         Enrolls a new face signature for a student.
         1. Decodes and runs quality/blur checks on the image.
@@ -48,6 +51,29 @@ class AttendanceService:
         # 3. Generate Embedding
         embedding = ai_engine.generate_embeddings(img, faces[0]["box"])
         
+        # Save or update StudentProfile if roll_number is provided
+        if roll_number:
+            profile = StudentProfile.query.filter_by(student_id=s_uuid).first()
+            if not profile:
+                profile = StudentProfile(
+                    tenant_id=t_uuid,
+                    student_id=s_uuid,
+                    roll_number=roll_number,
+                    mobile_number=mobile_number,
+                    department=department,
+                    course=course,
+                    semester_grade=semester_grade,
+                    section=section
+                )
+                db.session.add(profile)
+            else:
+                profile.roll_number = roll_number
+                profile.mobile_number = mobile_number
+                profile.department = department
+                profile.course = course
+                profile.semester_grade = semester_grade
+                profile.section = section
+
         # Save to database
         face_record = StudentFace(
             tenant_id=t_uuid,
@@ -235,3 +261,194 @@ class AttendanceService:
 
         db.session.commit()
         return correction
+
+    @staticmethod
+    def get_timetable(tenant_id: str, teacher_id: str):
+        """
+        Lists timetable slots for a teacher.
+        """
+        from backend.app.domains.academic.models import TimetableSlot, Subject, Section, Class, Course
+        t_uuid = uuid.UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
+        teach_uuid = uuid.UUID(teacher_id) if isinstance(teacher_id, str) else teacher_id
+
+        slots = db.session.query(TimetableSlot, Subject, Section, Class, Course)\
+            .join(Subject, TimetableSlot.subject_id == Subject.id)\
+            .join(Section, TimetableSlot.section_id == Section.id)\
+            .join(Class, Section.class_id == Class.id)\
+            .join(Course, Class.course_id == Course.id)\
+            .filter(TimetableSlot.tenant_id == t_uuid, TimetableSlot.teacher_id == teach_uuid).all()
+
+        results = []
+        for slot, subject, section, cls, course in slots:
+            results.append({
+                "id": str(slot.id),
+                "day_of_week": slot.day_of_week,
+                "start_time": slot.start_time.strftime("%H:%M") if slot.start_time else "",
+                "end_time": slot.end_time.strftime("%H:%M") if slot.end_time else "",
+                "room_number": slot.room_number,
+                "subject": {
+                    "id": str(subject.id),
+                    "name": subject.name,
+                    "code": subject.code
+                },
+                "section": {
+                    "id": str(section.id),
+                    "name": section.name
+                },
+                "class": {
+                    "id": str(cls.id),
+                    "name": cls.name
+                },
+                "course": {
+                    "id": str(course.id),
+                    "name": course.name
+                }
+            })
+        return results
+
+    @staticmethod
+    def get_students_for_section(tenant_id: str, section_id: str = None):
+        """
+        Returns users with the role 'Student' in the given tenant and section.
+        Also attaches their student profile and face enrollment status.
+        """
+        t_uuid = uuid.UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
+        
+        query = User.query.filter_by(tenant_id=t_uuid)
+        users = query.all()
+        
+        results = []
+        for user in users:
+            is_student = False
+            for role in user.roles:
+                if role.name.lower() == "student":
+                    is_student = True
+                    break
+            
+            if not is_student:
+                continue
+
+            profile = StudentProfile.query.filter_by(student_id=user.id).first()
+            if section_id and (not profile or str(profile.section) != str(section_id)):
+                continue
+
+            face = StudentFace.query.filter_by(student_id=user.id).first()
+            
+            results.append({
+                "id": str(user.id),
+                "email": user.email,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "is_enrolled": face is not None,
+                "profile": {
+                    "roll_number": profile.roll_number if profile else "",
+                    "mobile_number": profile.mobile_number if profile else "",
+                    "department": profile.department if profile else "",
+                    "course": profile.course if profile else "",
+                    "semester_grade": profile.semester_grade if profile else "",
+                    "section": profile.section if profile else "",
+                    "profile_photo_url": profile.profile_photo_url if profile else ""
+                } if profile else None
+            })
+        return results
+
+    @staticmethod
+    def get_sessions(tenant_id: str, user_id: str, is_teacher: bool):
+        """
+        Lists attendance sessions for a teacher or a student.
+        """
+        t_uuid = uuid.UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
+        user_uuid = uuid.UUID(user_id) if isinstance(user_id, str) else user_id
+        
+        if is_teacher:
+            sessions = AttendanceSession.query.filter_by(tenant_id=t_uuid, teacher_id=user_uuid).order_by(AttendanceSession.date.desc()).all()
+        else:
+            records = AttendanceRecord.query.filter_by(tenant_id=t_uuid, student_id=user_uuid).all()
+            session_ids = [r.session_id for r in records]
+            if session_ids:
+                sessions = AttendanceSession.query.filter(AttendanceSession.id.in_(session_ids)).order_by(AttendanceSession.date.desc()).all()
+            else:
+                sessions = []
+
+        results = []
+        for s in sessions:
+            results.append({
+                "id": str(s.id),
+                "date": s.date.isoformat(),
+                "start_time": s.start_time.isoformat() if s.start_time else "",
+                "status": s.status,
+                "gps_latitude": float(s.gps_latitude) if s.gps_latitude else None,
+                "gps_longitude": float(s.gps_longitude) if s.gps_longitude else None,
+                "gps_radius_meters": s.gps_radius_meters
+            })
+        return results
+
+    @staticmethod
+    def get_session_details(tenant_id: str, session_id: str):
+        """
+        Retrieves details of an attendance session and its corresponding records.
+        """
+        t_uuid = uuid.UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
+        sess_uuid = uuid.UUID(session_id) if isinstance(session_id, str) else session_id
+        
+        session = AttendanceSession.query.filter_by(tenant_id=t_uuid, id=sess_uuid).first()
+        if not session:
+            raise NotFoundException("Attendance session not found")
+
+        records = AttendanceRecord.query.filter_by(session_id=session.id).all()
+        records_list = []
+        for r in records:
+            student = User.query.get(r.student_id)
+            profile = StudentProfile.query.filter_by(student_id=r.student_id).first()
+            records_list.append({
+                "record_id": str(r.id),
+                "student_id": str(r.student_id),
+                "student_name": f"{student.first_name} {student.last_name}" if student else "Unknown Student",
+                "roll_number": profile.roll_number if profile else "",
+                "status": r.status,
+                "verification_method": r.verification_method,
+                "confidence_score": r.confidence_score,
+                "updated_at": r.updated_at.isoformat()
+            })
+            
+        return {
+            "session_id": str(session.id),
+            "date": session.date.isoformat(),
+            "status": session.status,
+            "records": records_list
+        }
+
+    @staticmethod
+    def get_corrections(tenant_id: str, user_id: str, is_teacher: bool):
+        """
+        Lists attendance correction requests.
+        """
+        t_uuid = uuid.UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
+        user_uuid = uuid.UUID(user_id) if isinstance(user_id, str) else user_id
+        
+        if is_teacher:
+            corrections = AttendanceCorrection.query.filter_by(tenant_id=t_uuid).all()
+        else:
+            corrections = AttendanceCorrection.query.filter_by(tenant_id=t_uuid, student_id=user_uuid).all()
+            
+        results = []
+        for c in corrections:
+            student = User.query.get(c.student_id)
+            record = AttendanceRecord.query.get(c.record_id)
+            session = AttendanceSession.query.get(record.session_id) if record else None
+            
+            results.append({
+                "id": str(c.id),
+                "student_id": str(c.student_id),
+                "student_name": f"{student.first_name} {student.last_name}" if student else "Unknown",
+                "record_id": str(c.record_id),
+                "current_status": record.status if record else "unknown",
+                "session_date": session.date.isoformat() if session else "",
+                "requested_status": c.requested_status,
+                "reason": c.reason,
+                "evidence_url": c.evidence_url,
+                "status": c.status,
+                "review_comments": c.review_comments,
+                "created_at": c.created_at.isoformat()
+            })
+        return results

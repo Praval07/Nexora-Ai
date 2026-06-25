@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { Card, Button, Badge } from '../components/Core';
+import { AttendanceModule } from '../components/AttendanceModule';
 
 export const Dashboard: React.FC = () => {
   const { user, logout } = useAuth();
-  const [activeTab, setActiveTab] = useState<'overview' | 'lms' | 'chat'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'lms' | 'chat' | 'attendance'>('overview');
 
   if (!user) return null;
 
@@ -48,6 +49,14 @@ export const Dashboard: React.FC = () => {
               }`}
             >
               <span>Real-Time Chat</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('attendance')}
+              className={`w-full flex items-center space-x-3 px-4 py-2.5 rounded-lg text-sm font-semibold transition-all ${
+                activeTab === 'attendance' ? 'bg-indigo-600/10 text-indigo-400' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/30'
+              }`}
+            >
+              <span>AI Attendance</span>
             </button>
           </div>
         </div>
@@ -300,6 +309,10 @@ export const Dashboard: React.FC = () => {
               </div>
             </Card>
           </div>
+        )}
+
+        {activeTab === 'attendance' && (
+          <AttendanceModule role={role} userId={user.id} />
         )}
       </main>
     </div>

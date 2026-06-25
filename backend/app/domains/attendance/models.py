@@ -2,6 +2,21 @@ import uuid
 from datetime import datetime
 from backend.app.core.database import db
 
+class StudentProfile(db.Model):
+    __tablename__ = "student_profiles"
+    
+    id = db.Column(db.UUID, primary_key=True, default=uuid.uuid4)
+    tenant_id = db.Column(db.UUID, db.ForeignKey("institutions.id", ondelete="CASCADE"), nullable=False)
+    student_id = db.Column(db.UUID, db.ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
+    roll_number = db.Column(db.String(50), unique=True, nullable=False)
+    mobile_number = db.Column(db.String(20))
+    department = db.Column(db.String(100))
+    course = db.Column(db.String(100))
+    semester_grade = db.Column(db.String(50))
+    section = db.Column(db.String(50))
+    profile_photo_url = db.Column(db.String(512))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 class StudentFace(db.Model):
     __tablename__ = "student_faces"
     
