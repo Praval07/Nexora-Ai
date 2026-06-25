@@ -132,3 +132,185 @@ def test_attendance_session_lifecycle(client, setup_data):
     record = AttendanceRecord.query.filter_by(session_id=uuid.UUID(session_id)).first()
     assert record is not None
     assert record.status == "present"
+
+def test_successful_enrollment_and_processing(client, setup_data, dummy_image):
+    from unittest.mock import patch
+    headers = {"Authorization": f"Bearer {setup_data['teacher_token']}"}
+    
+    with patch("backend.app.domains.attendance.services.ai_engine.validate_image_quality", return_value=(True, "Success")), \
+         patch("backend.app.domains.attendance.services.ai_engine.detect_and_align_faces", return_value=[{"x": 10, "y": 10, "w": 50, "h": 50, "box": (10, 60, 60, 10)}]):
+        
+        # 1. Enroll face
+        enroll_data = {
+            "student_id": str(setup_data["student"].id),
+            "file": (io.BytesIO(dummy_image), "face.jpg"),
+            "roll_number": "ROLL-001",
+            "department": "Computer Science"
+        }
+        res_enroll = client.post(
+            "/api/v1/attendance/enroll",
+            data=enroll_data,
+            content_type="multipart/form-data",
+            headers=headers
+        )
+        assert res_enroll.status_code == 201
+        
+        # 2. Create session draft
+        session_payload = {"latitude": 42.3601, "longitude": -71.0942, "radius": 100}
+        res_sess = client.post("/api/v1/attendance/sessions", json=session_payload, headers=headers)
+        assert res_sess.status_code == 201
+        session_id = res_sess.get_json()["data"]["session_id"]
+        
+        # 3. Process classroom photo (which should match the enrolled face)
+        process_data = {
+            "file": (io.BytesIO(dummy_image), "classroom.jpg")
+        }
+        res_process = client.post(
+            f"/api/v1/attendance/sessions/{session_id}/process",
+            data=process_data,
+            content_type="multipart/form-data",
+            headers=headers
+        )
+        assert res_process.status_code == 200
+        json_data = res_process.get_json()
+        assert "matches" in json_data["data"]
+
+def test_file_upload_validations(client, setup_data, dummy_image):
+    headers = {"Authorization": f"Bearer {setup_data['teacher_token']}"}
+    
+    # 1. Invalid Extension
+    data_ext = {
+        "student_id": str(setup_data["student"].id),
+        "file": (io.BytesIO(dummy_image), "face.txt")
+    }
+    res_ext = client.post("/api/v1/attendance/enroll", data=data_ext, content_type="multipart/form-data", headers=headers)
+    assert res_ext.status_code == 400
+    assert "Unsupported image format" in res_ext.get_json()["message"]
+
+    # 2. Exceeds Size (simulate 6MB payload)
+    large_bytes = b"0" * (6 * 1024 * 1024)
+    data_size = {
+        "student_id": str(setup_data["student"].id),
+        "file": (io.BytesIO(large_bytes), "face.jpg")
+    }
+    res_size = client.post("/api/v1/attendance/enroll", data=data_size, content_type="multipart/form-data", headers=headers)
+    assert res_size.status_code == 400
+    assert "exceeds 5MB limit" in res_size.get_json()["message"]
+
+def test_cross_tenant_isolation(client, setup_data, dummy_image):
+    from backend.app import db
+    from backend.app.domains.auth.models import Institution, User, Role, Permission
+    
+    inst_b = Institution(name="Harvard", subdomain="harvard")
+    db.session.add(inst_b)
+    db.session.flush()
+    
+    teacher_b = User(tenant_id=inst_b.id, email="teacher@harvard.edu", password_hash="dummy", first_name="H", last_name="Teacher")
+    db.session.add(teacher_b)
+    db.session.flush()
+    
+    mark_perm = Permission.query.filter_by(code="attendance:mark").first()
+    role_b = Role(tenant_id=inst_b.id, name="Teacher")
+    role_b.permissions = [mark_perm]
+    db.session.add(role_b)
+    db.session.flush()
+    
+    teacher_b.roles.append(role_b)
+    db.session.commit()
+    
+    teacher_b_token = create_access_token(
+        identity=str(teacher_b.id), 
+        additional_claims={"tenant_id": str(inst_b.id), "permissions": ["attendance:mark"]}
+    )
+    
+    # 1. Teacher B starts session for Tenant B
+    headers_b = {"Authorization": f"Bearer {teacher_b_token}"}
+    session_payload = {"latitude": 42.3601, "longitude": -71.0942, "radius": 100}
+    res_sess = client.post("/api/v1/attendance/sessions", json=session_payload, headers=headers_b)
+    assert res_sess.status_code == 201
+    session_id = res_sess.get_json()["data"]["session_id"]
+    
+    # 2. Teacher A (from MIT) tries to process photo for Harvard's session_id
+    headers_a = {"Authorization": f"Bearer {setup_data['teacher_token']}"}
+    process_data = {"file": (io.BytesIO(dummy_image), "classroom.jpg")}
+    
+    res_malicious = client.post(
+        f"/api/v1/attendance/sessions/{session_id}/process",
+        data=process_data,
+        content_type="multipart/form-data",
+        headers=headers_a
+    )
+    # Must be 403 Forbidden!
+    assert res_malicious.status_code == 403
+    assert "Tenant mismatch" in res_malicious.get_json()["message"]
+
+def test_face_approval_lifecycle_and_duplicates(client, setup_data, dummy_image):
+    from unittest.mock import patch
+    from backend.app import db
+    from backend.app.domains.auth.models import User
+    
+    headers = {"Authorization": f"Bearer {setup_data['teacher_token']}"}
+    
+    # Set AUTO_APPROVE_FACIAL_ENROLLMENT to False
+    client.application.config["AUTO_APPROVE_FACIAL_ENROLLMENT"] = False
+    
+    with patch("backend.app.domains.attendance.services.ai_engine.validate_image_quality", return_value=(True, "Success")), \
+         patch("backend.app.domains.attendance.services.ai_engine.detect_and_align_faces", return_value=[{"x": 10, "y": 10, "w": 50, "h": 50, "box": (10, 60, 60, 10)}]):
+        
+        # 1. Enroll face for student (will be pending_approval)
+        enroll_data = {
+            "student_id": str(setup_data["student"].id),
+            "file": (io.BytesIO(dummy_image), "face.jpg"),
+            "roll_number": "ROLL-111"
+        }
+        res_enroll = client.post("/api/v1/attendance/enroll", data=enroll_data, content_type="multipart/form-data", headers=headers)
+        assert res_enroll.status_code == 201
+        face_id = res_enroll.get_json()["data"]["face_id"]
+        
+        # 2. Create session and process photo (should NOT match because face is pending approval)
+        res_sess = client.post("/api/v1/attendance/sessions", json={"radius": 100}, headers=headers)
+        session_id = res_sess.get_json()["data"]["session_id"]
+        
+        res_process_1 = client.post(
+            f"/api/v1/attendance/sessions/{session_id}/process",
+            data={"file": (io.BytesIO(dummy_image), "classroom.jpg")},
+            content_type="multipart/form-data",
+            headers=headers
+        )
+        assert res_process_1.status_code == 200
+        matches_1 = res_process_1.get_json()["data"]["matches"]
+        assert matches_1[0]["student_id"] is None  # no match
+        
+        # 3. Approve face
+        res_approve = client.post(f"/api/v1/attendance/faces/{face_id}/approve", headers=headers)
+        assert res_approve.status_code == 200
+        assert res_approve.get_json()["data"]["status"] == "approved"
+        
+        # 4. Process again: should match now!
+        res_process_2 = client.post(
+            f"/api/v1/attendance/sessions/{session_id}/process",
+            data={"file": (io.BytesIO(dummy_image), "classroom.jpg")},
+            content_type="multipart/form-data",
+            headers=headers
+        )
+        assert res_process_2.status_code == 200
+        matches_2 = res_process_2.get_json()["data"]["matches"]
+        assert matches_2[0]["student_id"] == str(setup_data["student"].id)
+        
+        # 5. Duplicate Check: Create another student and try to enroll the SAME face
+        student_c = User(tenant_id=setup_data["institution"].id, email="student_c@mit.edu", password_hash="dummy", first_name="C", last_name="Student")
+        db.session.add(student_c)
+        db.session.commit()
+        
+        enroll_data_c = {
+            "student_id": str(student_c.id),
+            "file": (io.BytesIO(dummy_image), "face.jpg"),
+            "roll_number": "ROLL-222"
+        }
+        res_enroll_c = client.post("/api/v1/attendance/enroll", data=enroll_data_c, content_type="multipart/form-data", headers=headers)
+        # Should fail with 409 Conflict due to duplicate face detection!
+        assert res_enroll_c.status_code == 409
+        assert "reuse is prohibited" in res_enroll_c.get_json()["message"]
+        
+    # Reset config for other tests
+    client.application.config["AUTO_APPROVE_FACIAL_ENROLLMENT"] = True

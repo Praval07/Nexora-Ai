@@ -1,13 +1,33 @@
 import logging
+import os
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
 from backend.app.domains.attendance.services import AttendanceService
 from backend.app.core.security import require_permission
-from backend.app.core.exceptions import BadRequestException
+from backend.app.core.exceptions import BadRequestException, ForbiddenException, NotFoundException
 
 logger = logging.getLogger(__name__)
 
 attendance_bp = Blueprint("attendance", __name__)
+
+def validate_uploaded_file(file):
+    """
+    Validates file extension, size limit (5MB), and name.
+    """
+    if not file or not file.filename:
+        raise BadRequestException("Missing upload file")
+        
+    allowed_extensions = {".jpg", ".jpeg", ".png"}
+    _, ext = os.path.splitext(file.filename.lower())
+    if ext not in allowed_extensions:
+        raise BadRequestException("Unsupported image format. Allowed formats: JPG, JPEG, PNG.")
+        
+    # Read bytes and check length
+    image_bytes = file.read()
+    if len(image_bytes) > 5 * 1024 * 1024:
+        raise BadRequestException("File size exceeds 5MB limit")
+        
+    return image_bytes
 
 @attendance_bp.route("/enroll", methods=["POST"])
 @jwt_required()
@@ -25,7 +45,7 @@ def enroll_student_face():
         
     claims = get_jwt()
     tenant_id = claims.get("tenant_id")
-    image_bytes = file.read()
+    image_bytes = validate_uploaded_file(file)
     
     face = AttendanceService.enroll_student_face(
         tenant_id=tenant_id,
@@ -92,11 +112,21 @@ def process_classroom_photo(session_id):
     Endpoint to upload and process a classroom photo for AI face matching.
     Expects multipart/form-data with 'file'.
     """
+    from backend.app.domains.attendance.models import AttendanceSession
+    session = AttendanceSession.query.filter_by(id=session_id).first()
+    if not session:
+        raise NotFoundException("Attendance session not found")
+        
+    claims = get_jwt()
+    tenant_id = claims.get("tenant_id")
+    if str(session.tenant_id) != str(tenant_id):
+        raise ForbiddenException("Access denied: Tenant mismatch.")
+
     file = request.files.get("file")
     if not file:
         raise BadRequestException("Missing upload 'file'")
         
-    image_bytes = file.read()
+    image_bytes = validate_uploaded_file(file)
     matches = AttendanceService.process_classroom_photo(
         session_id=str(session_id),
         image_bytes=image_bytes
@@ -116,6 +146,16 @@ def confirm_attendance(session_id):
     """
     Endpoint to finalize and lock the attendance session.
     """
+    from backend.app.domains.attendance.models import AttendanceSession
+    session = AttendanceSession.query.filter_by(id=session_id).first()
+    if not session:
+        raise NotFoundException("Attendance session not found")
+        
+    claims = get_jwt()
+    tenant_id = claims.get("tenant_id")
+    if str(session.tenant_id) != str(tenant_id):
+        raise ForbiddenException("Access denied: Tenant mismatch.")
+
     data = request.get_json() or {}
     records = data.get("records")
     if not records or not isinstance(records, list):
@@ -125,7 +165,7 @@ def confirm_attendance(session_id):
     ip_address = request.remote_addr or "127.0.0.1"
     user_agent = request.user_agent.string or "unknown"
     
-    session = AttendanceService.confirm_attendance(
+    confirmed_session = AttendanceService.confirm_attendance(
         session_id=str(session_id),
         confirmed_records=records,
         teacher_id=teacher_id,
@@ -303,5 +343,31 @@ def get_corrections():
         "status": "success",
         "data": {
             "corrections": corrections
+        }
+    }), 200
+
+@attendance_bp.route("/faces/<uuid:face_id>/approve", methods=["POST"])
+@jwt_required()
+@require_permission("users:manage")
+def approve_student_face(face_id):
+    """
+    Endpoint for admins/teachers to approve pending student face registrations.
+    """
+    claims = get_jwt()
+    tenant_id = claims.get("tenant_id")
+    reviewer_id = get_jwt_identity()
+    
+    face = AttendanceService.approve_face(
+        tenant_id=tenant_id,
+        face_id=str(face_id),
+        reviewer_id=reviewer_id
+    )
+    
+    return jsonify({
+        "status": "success",
+        "message": "Student face approved successfully",
+        "data": {
+            "face_id": str(face.id),
+            "status": face.status
         }
     }), 200

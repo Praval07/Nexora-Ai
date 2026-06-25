@@ -139,13 +139,35 @@ class AIAttendanceEngine:
         
         return int(best_idx), float(confidence)
 
+    def preprocess_image(self, img_np: np.ndarray) -> np.ndarray:
+        """
+        Applies CLAHE brightness correction and bilateral noise filtering
+        to the image to optimize recognition rates.
+        """
+        # Convert to LAB color space to equalize brightness on the L (Luminance) channel
+        lab = cv2.cvtColor(img_np, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        
+        # Apply CLAHE
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        cl = clahe.apply(l)
+        
+        # Merge back and convert to BGR
+        merged = cv2.merge((cl, a, b))
+        enhanced = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+        
+        # Apply Bilateral filter to smooth noise while keeping face edges sharp
+        filtered = cv2.bilateralFilter(enhanced, d=5, sigmaColor=50, sigmaSpace=50)
+        return filtered
+
     def process_classroom_image(self, image_bytes: bytes, registered_students: list[dict], threshold_config: dict = None) -> list[dict]:
         """
         Processes a classroom image:
         1. Decodes image and checks quality.
-        2. Detects all faces.
-        3. Generates embeddings and matches against registered student embeddings.
-        4. Classifies as Present, Low-Confidence, or Unknown.
+        2. Downscales if too large and pre-processes.
+        3. Detects all faces (capped at 150).
+        4. Generates embeddings and matches against registered student embeddings.
+        5. Classifies as Present, Low-Confidence, or Unknown.
         """
         # Load image
         np_arr = np.frombuffer(image_bytes, np.uint8)
@@ -161,14 +183,28 @@ class AIAttendanceEngine:
         if not is_ok:
             raise ValueError(f"Quality Check Failed: {quality_msg}")
 
+        # Scale down large image to maximum width of 1280px to prevent CPU exhaustion
+        h, w = img.shape[:2]
+        if w > 1280:
+            scale = 1280.0 / w
+            new_h = int(h * scale)
+            img = cv2.resize(img, (1280, new_h))
+
+        # Apply image preprocessing pipeline
+        img = self.preprocess_image(img)
+
         # 2. Detect Faces
         detected_faces = self.detect_align_faces_compatibility(img)
+        
+        # Capping face count for DoS security mitigation
+        if len(detected_faces) > 150:
+            logger.warning(f"Excessive faces detected ({len(detected_faces)}). Capping to 150.")
+            detected_faces = detected_faces[:150]
         
         # Pull registered student embeddings
         registered_ids = []
         registered_vecs = []
         for s in registered_students:
-            # An individual student may have multiple embeddings
             for emb in s.get("embeddings", []):
                 registered_ids.append(s["student_id"])
                 registered_vecs.append(emb)
@@ -188,10 +224,11 @@ class AIAttendanceEngine:
             
             if best_idx != -1 and confidence >= thresholds["verify"]:
                 candidate_id = registered_ids[best_idx]
+                candidate_str = str(candidate_id)
                 # Anti-Cheating: Duplicate detection (prevent same student from being double counted)
-                if candidate_id not in assigned_student_ids:
+                if candidate_str not in assigned_student_ids:
                     match_student_id = candidate_id
-                    assigned_student_ids.add(candidate_id)
+                    assigned_student_ids.add(candidate_str)
                     status = "present" if confidence >= thresholds["auto_present"] else "verify"
             
             results.append({
@@ -201,7 +238,7 @@ class AIAttendanceEngine:
                     "w": face["w"],
                     "h": face["h"]
                 },
-                "student_id": match_student_id,
+                "student_id": str(match_student_id) if match_student_id else None,
                 "confidence": confidence,
                 "status": status
             })

@@ -1,5 +1,9 @@
 import uuid
+import base64
+import json
+import hashlib
 from datetime import datetime
+from flask import current_app
 from backend.app.core.database import db
 from backend.app.domains.attendance.models import StudentFace, StudentProfile, AttendanceSession, AttendanceRecord, AttendanceCorrection
 from backend.app.domains.attendance.ai_engine import AIAttendanceEngine
@@ -10,6 +14,37 @@ from backend.app.core.exceptions import NotFoundException, BadRequestException, 
 ai_engine = AIAttendanceEngine()
 
 class AttendanceService:
+    @staticmethod
+    def _get_encryption_key():
+        # Get key from Flask config, default to a robust fallback key
+        return current_app.config.get("SECRET_KEY", "nexora-ai-default-key-32bytes-long")
+
+    @staticmethod
+    def encrypt_embedding(embedding: list[float]) -> dict:
+        key = AttendanceService._get_encryption_key()
+        plain_bytes = json.dumps(embedding).encode('utf-8')
+        key_hash = hashlib.sha256(key.encode('utf-8')).digest()
+        cipher_bytes = bytearray(len(plain_bytes))
+        for i in range(len(plain_bytes)):
+            block_hash = hashlib.sha256(key_hash + str(i // 32).encode('utf-8')).digest()
+            cipher_bytes[i] = plain_bytes[i] ^ block_hash[i % 32]
+        return {
+            "encrypted": True,
+            "ciphertext": base64.b64encode(cipher_bytes).decode('utf-8')
+        }
+
+    @staticmethod
+    def decrypt_embedding(encrypted_data: dict) -> list[float]:
+        if not isinstance(encrypted_data, dict) or not encrypted_data.get("encrypted"):
+            return encrypted_data
+        key = AttendanceService._get_encryption_key()
+        cipher_bytes = base64.b64decode(encrypted_data["ciphertext"])
+        key_hash = hashlib.sha256(key.encode('utf-8')).digest()
+        plain_bytes = bytearray(len(cipher_bytes))
+        for i in range(len(cipher_bytes)):
+            block_hash = hashlib.sha256(key_hash + str(i // 32).encode('utf-8')).digest()
+            plain_bytes[i] = cipher_bytes[i] ^ block_hash[i % 32]
+        return json.loads(plain_bytes.decode('utf-8'))
     @staticmethod
     def enroll_student_face(tenant_id: str, student_id: str, image_bytes: bytes,
                             roll_number: str = None, mobile_number: str = None,
@@ -74,12 +109,41 @@ class AttendanceService:
                 profile.semester_grade = semester_grade
                 profile.section = section
 
+        # Check duplicate face registration (Anti-Proxy identity hijack prevention)
+        existing_faces = StudentFace.query.filter_by(tenant_id=t_uuid, status="approved").all()
+        if existing_faces:
+            registered_ids = []
+            registered_vecs = []
+            for ef in existing_faces:
+                if ef.student_id != s_uuid:
+                    try:
+                        dec_emb = AttendanceService.decrypt_embedding(ef.embedding)
+                        registered_ids.append(ef.student_id)
+                        registered_vecs.append(dec_emb)
+                    except Exception:
+                        pass
+            
+            if registered_vecs:
+                best_idx, confidence = ai_engine.match_faces(embedding, registered_vecs)
+                if best_idx != -1 and confidence >= 90.0:
+                    matched_student = db.session.get(User, registered_ids[best_idx])
+                    matched_name = f"{matched_student.first_name} {matched_student.last_name}" if matched_student else "Another Student"
+                    raise ConflictException(f"Face is already registered to {matched_name}. Multi-account face reuse is prohibited.")
+
+        # Encrypt the embedding before storing
+        encrypted_embedding = AttendanceService.encrypt_embedding(embedding)
+
+        # Set status based on app config
+        auto_approve = current_app.config.get("AUTO_APPROVE_FACIAL_ENROLLMENT", True)
+        status = "approved" if auto_approve else "pending_approval"
+
         # Save to database
         face_record = StudentFace(
             tenant_id=t_uuid,
             student_id=s_uuid,
-            embedding=embedding,
-            image_quality_score=quality_score
+            embedding=encrypted_embedding,
+            image_quality_score=quality_score,
+            status=status
         )
         db.session.add(face_record)
         db.session.commit()
@@ -127,7 +191,11 @@ class AttendanceService:
             s_str = str(face.student_id)
             if s_str not in student_map:
                 student_map[s_str] = {"student_id": face.student_id, "embeddings": []}
-            student_map[s_str]["embeddings"].append(face.embedding)
+            try:
+                dec_emb = AttendanceService.decrypt_embedding(face.embedding)
+                student_map[s_str]["embeddings"].append(dec_emb)
+            except Exception:
+                pass
 
         registered_students = list(student_map.values())
 
@@ -169,6 +237,7 @@ class AttendanceService:
                 existing.status = status
                 existing.verification_method = method
                 existing.confidence_score = score
+                existing.is_deleted = False
             else:
                 new_record = AttendanceRecord(
                     tenant_id=session.tenant_id,
@@ -176,7 +245,8 @@ class AttendanceService:
                     student_id=s_uuid,
                     status=status,
                     verification_method=method,
-                    confidence_score=score
+                    confidence_score=score,
+                    is_deleted=False
                 )
                 db.session.add(new_record)
 
@@ -204,7 +274,7 @@ class AttendanceService:
         r_uuid = uuid.UUID(record_id) if isinstance(record_id, str) else record_id
 
         # Verify record exists
-        record = db.session.get(AttendanceRecord, r_uuid)
+        record = AttendanceRecord.query.filter_by(id=r_uuid, is_deleted=False).first()
         if not record or record.student_id != s_uuid:
             raise NotFoundException("Attendance record not found")
 
@@ -240,9 +310,8 @@ class AttendanceService:
         correction.status = status
         correction.reviewed_by = rev_uuid
         correction.review_comments = comments
-
         if status == "approved":
-            record = db.session.get(AttendanceRecord, correction.record_id)
+            record = AttendanceRecord.query.filter_by(id=correction.record_id, is_deleted=False).first()
             if record:
                 old_status = record.status
                 record.status = correction.requested_status
@@ -363,7 +432,7 @@ class AttendanceService:
         if is_teacher:
             sessions = AttendanceSession.query.filter_by(tenant_id=t_uuid, teacher_id=user_uuid).order_by(AttendanceSession.date.desc()).all()
         else:
-            records = AttendanceRecord.query.filter_by(tenant_id=t_uuid, student_id=user_uuid).all()
+            records = AttendanceRecord.query.filter_by(tenant_id=t_uuid, student_id=user_uuid, is_deleted=False).all()
             session_ids = [r.session_id for r in records]
             if session_ids:
                 sessions = AttendanceSession.query.filter(AttendanceSession.id.in_(session_ids)).order_by(AttendanceSession.date.desc()).all()
@@ -395,10 +464,10 @@ class AttendanceService:
         if not session:
             raise NotFoundException("Attendance session not found")
 
-        records = AttendanceRecord.query.filter_by(session_id=session.id).all()
+        records = AttendanceRecord.query.filter_by(session_id=session.id, is_deleted=False).all()
         records_list = []
         for r in records:
-            student = User.query.get(r.student_id)
+            student = db.session.get(User, r.student_id)
             profile = StudentProfile.query.filter_by(student_id=r.student_id).first()
             records_list.append({
                 "record_id": str(r.id),
@@ -433,9 +502,9 @@ class AttendanceService:
             
         results = []
         for c in corrections:
-            student = User.query.get(c.student_id)
-            record = AttendanceRecord.query.get(c.record_id)
-            session = AttendanceSession.query.get(record.session_id) if record else None
+            student = db.session.get(User, c.student_id)
+            record = AttendanceRecord.query.filter_by(id=c.record_id, is_deleted=False).first()
+            session = db.session.get(AttendanceSession, record.session_id) if record else None
             
             results.append({
                 "id": str(c.id),
@@ -452,3 +521,32 @@ class AttendanceService:
                 "created_at": c.created_at.isoformat()
             })
         return results
+
+    @staticmethod
+    def approve_face(tenant_id: str, face_id: str, reviewer_id: str):
+        """
+        Approves a pending face registration and supersedes any previously active face
+        registrations for the same student.
+        """
+        t_uuid = uuid.UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
+        f_uuid = uuid.UUID(face_id) if isinstance(face_id, str) else face_id
+        rev_uuid = uuid.UUID(reviewer_id) if isinstance(reviewer_id, str) else reviewer_id
+        
+        face = StudentFace.query.filter_by(tenant_id=t_uuid, id=f_uuid).first()
+        if not face:
+            raise NotFoundException("Face enrollment record not found")
+            
+        # Supersede previous active faces for this student
+        previous_faces = StudentFace.query.filter_by(
+            tenant_id=t_uuid, 
+            student_id=face.student_id, 
+            status="approved"
+        ).all()
+        for pf in previous_faces:
+            if pf.id != face.id:
+                pf.status = "superseded"
+                
+        face.status = "approved"
+        face.approved_by = rev_uuid
+        db.session.commit()
+        return face
