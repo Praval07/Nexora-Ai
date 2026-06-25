@@ -8,7 +8,7 @@ from backend.app.core.database import db
 from backend.app.domains.attendance.models import StudentFace, StudentProfile, AttendanceSession, AttendanceRecord, AttendanceCorrection
 from backend.app.domains.attendance.ai_engine import AIAttendanceEngine
 from backend.app.domains.auth.models import User, AuditLog
-from backend.app.core.exceptions import NotFoundException, BadRequestException, ConflictException
+from backend.app.core.exceptions import NotFoundException, BadRequestException, ConflictException, ForbiddenException
 
 # Instantiate global AI engine
 ai_engine = AIAttendanceEngine()
@@ -58,6 +58,11 @@ class AttendanceService:
         """
         t_uuid = uuid.UUID(tenant_id) if isinstance(tenant_id, str) else tenant_id
         s_uuid = uuid.UUID(student_id) if isinstance(student_id, str) else student_id
+
+        # Verify student exists and belongs to this tenant
+        student_user = db.session.get(User, s_uuid)
+        if not student_user or str(student_user.tenant_id) != str(t_uuid):
+            raise ForbiddenException("Student does not belong to this tenant")
 
         # Decode image using OpenCV
         import cv2
@@ -231,6 +236,11 @@ class AttendanceService:
             method = record.get("verification_method", "face_auto")
             score = record.get("confidence_score")
 
+            # Verify student exists and belongs to the session's tenant
+            student_user = db.session.get(User, s_uuid)
+            if not student_user or str(student_user.tenant_id) != str(session.tenant_id):
+                raise ForbiddenException(f"Student {s_uuid} does not belong to this tenant")
+
             # Check duplicate database insertion
             existing = AttendanceRecord.query.filter_by(session_id=session.id, student_id=s_uuid).first()
             if existing:
@@ -277,6 +287,8 @@ class AttendanceService:
         record = AttendanceRecord.query.filter_by(id=r_uuid, is_deleted=False).first()
         if not record or record.student_id != s_uuid:
             raise NotFoundException("Attendance record not found")
+        if str(record.tenant_id) != str(t_uuid):
+            raise ForbiddenException("Tenant mismatch for correction request")
 
         correction = AttendanceCorrection(
             tenant_id=t_uuid,
@@ -303,6 +315,12 @@ class AttendanceService:
         correction = db.session.get(AttendanceCorrection, c_uuid)
         if not correction:
             raise NotFoundException("Correction request not found")
+            
+        # Verify reviewer belongs to same tenant
+        reviewer = db.session.get(User, rev_uuid)
+        if not reviewer or str(reviewer.tenant_id) != str(correction.tenant_id):
+            raise ForbiddenException("Reviewer does not belong to the same tenant as the correction request")
+
         if correction.status != "pending":
             raise ConflictException("Correction request has already been reviewed")
 

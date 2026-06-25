@@ -314,3 +314,47 @@ def test_face_approval_lifecycle_and_duplicates(client, setup_data, dummy_image)
         
     # Reset config for other tests
     client.application.config["AUTO_APPROVE_FACIAL_ENROLLMENT"] = True
+
+def test_cross_tenant_vulnerabilities(client, setup_data, dummy_image):
+    from backend.app import db
+    from backend.app.domains.auth.models import Institution, User, Role, Permission
+    from backend.app.domains.attendance.models import AttendanceSession, AttendanceRecord, AttendanceCorrection
+    
+    # 1. Create a second institution (Tenant B) and a student belonging to Tenant B
+    inst_b = Institution(name="Harvard", subdomain="harvard")
+    db.session.add(inst_b)
+    db.session.flush()
+    
+    student_b = User(tenant_id=inst_b.id, email="student@harvard.edu", password_hash="dummy", first_name="H", last_name="Student")
+    db.session.add(student_b)
+    db.session.commit()
+    
+    # 2. Teacher A (MIT) tries to enroll a face for Student B (Harvard)
+    headers_a = {"Authorization": f"Bearer {setup_data['teacher_token']}"}
+    enroll_data = {
+        "student_id": str(student_b.id),
+        "file": (io.BytesIO(dummy_image), "face.jpg"),
+        "roll_number": "ROLL-HARVARD-01"
+    }
+    res_enroll = client.post("/api/v1/attendance/enroll", data=enroll_data, content_type="multipart/form-data", headers=headers_a)
+    assert res_enroll.status_code == 403
+    assert "Student does not belong to this tenant" in res_enroll.get_json()["message"]
+    
+    # 3. Teacher A (MIT) starts session for MIT
+    session_payload = {"latitude": 42.3601, "longitude": -71.0942, "radius": 100}
+    res_sess = client.post("/api/v1/attendance/sessions", json=session_payload, headers=headers_a)
+    session_id = res_sess.get_json()["data"]["session_id"]
+    
+    # 4. Teacher A tries to confirm attendance including Student B (Harvard)
+    confirm_payload = {
+        "records": [
+            {
+                "student_id": str(student_b.id),
+                "status": "present",
+                "verification_method": "teacher_manual"
+            }
+        ]
+    }
+    res_confirm = client.post(f"/api/v1/attendance/sessions/{session_id}/confirm", json=confirm_payload, headers=headers_a)
+    assert res_confirm.status_code == 403
+    assert "does not belong to this tenant" in res_confirm.get_json()["message"]
