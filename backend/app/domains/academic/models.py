@@ -59,3 +59,16 @@ class Subject(db.Model):
     section_id = db.Column(db.UUID, db.ForeignKey("sections.id", ondelete="CASCADE"), nullable=False)
     name = db.Column(db.String(255), nullable=False)
     code = db.Column(db.String(50), nullable=False)
+
+class TimetableSlot(db.Model):
+    __tablename__ = "timetable_slots"
+    
+    id = db.Column(db.UUID, primary_key=True, default=uuid.uuid4)
+    tenant_id = db.Column(db.UUID, db.ForeignKey("institutions.id", ondelete="CASCADE"), nullable=False)
+    section_id = db.Column(db.UUID, db.ForeignKey("sections.id", ondelete="CASCADE"), nullable=False)
+    subject_id = db.Column(db.UUID, db.ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False)
+    teacher_id = db.Column(db.UUID, db.ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    day_of_week = db.Column(db.Integer, nullable=False)  # 1 to 7
+    start_time = db.Column(db.Time, nullable=False)
+    end_time = db.Column(db.Time, nullable=False)
+    room_number = db.Column(db.String(50))

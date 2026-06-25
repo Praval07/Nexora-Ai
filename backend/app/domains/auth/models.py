@@ -82,3 +82,16 @@ class Permission(db.Model):
     id = db.Column(db.UUID, primary_key=True, default=uuid.uuid4)
     code = db.Column(db.String(100), unique=True, nullable=False)
     description = db.Column(db.String(255), nullable=False)
+
+class AuditLog(db.Model):
+    __tablename__ = "audit_logs"
+    
+    id = db.Column(db.UUID, primary_key=True, default=uuid.uuid4)
+    tenant_id = db.Column(db.UUID, db.ForeignKey("institutions.id", ondelete="CASCADE"), nullable=False)
+    user_id = db.Column(db.UUID, db.ForeignKey("users.id", ondelete="SET NULL"))
+    ip_address = db.Column(db.String(45), nullable=False)
+    user_agent = db.Column(db.Text, nullable=False)
+    action = db.Column(db.String(100), nullable=False)
+    previous_value = db.Column(db.JSON)
+    new_value = db.Column(db.JSON)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)

@@ -106,11 +106,13 @@ def register_blueprints(app):
     from backend.app.domains.auth.routes import auth_bp
     from backend.app.domains.lms.routes import lms_bp
     from backend.app.domains.chat.routes import chat_bp
+    from backend.app.domains.attendance.routes import attendance_bp
     
     # Versioned API path
     app.register_blueprint(auth_bp, url_prefix="/api/v1/auth")
     app.register_blueprint(lms_bp, url_prefix="/api/v1/lms")
     app.register_blueprint(chat_bp, url_prefix="/api/v1/chat")
+    app.register_blueprint(attendance_bp, url_prefix="/api/v1/attendance")
 
     # Import sockets module to register event handlers
     import backend.app.domains.chat.sockets
